@@ -1,12 +1,17 @@
+// server.js (Для PostgreSQL)
 const express = require('express');
-const { MongoClient } = require('mongodb'); // Импортируем MongoDB
+const { Pool } = require('pg'); // <-- Используем pg
 const app = express();
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000; 
 
-// Переменная MONGO_URL автоматически предоставляется Railway
-const uri = process.env.MONGO_URL; 
-const client = new MongoClient(uri);
+// Инициализация пула соединений с PostgreSQL, используя DATABASE_URL от Render
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL, 
+    ssl: { rejectUnauthorized: false } // Требуется для внешних хостингов, таких как Render
+});
+
+// ... (остальной код API, который вы уже писали, используя pool.connect() и client.query())
 
 // Подключение к БД и коллекции
 const DB_NAME = "roblox_db";
