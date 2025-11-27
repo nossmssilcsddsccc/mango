@@ -1,13 +1,13 @@
 {
   "name": "roblox-jobid-api",
   "version": "1.0.0",
-  "description": "API to serve Roblox Job IDs from MongoDB",
+  "description": "API to serve Roblox Job IDs from PostgreSQL",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "mongodb": "^6.3.0"  
+    "pg": "^8.11.3" 
   }
 }
