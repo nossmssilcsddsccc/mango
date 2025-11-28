@@ -52,7 +52,7 @@ async function initDb() {
             }
         }
         
-        // 3. Создаем индекс
+        // 3. Создаем индекс для быстрого поиска по времени
         await pool.query(`
             CREATE INDEX IF NOT EXISTS idx_timestamp ON ${TABLE_NAME} (timestamp);
         `);
@@ -68,7 +68,7 @@ async function initDb() {
 // API Эндпоинты
 // ------------------------------------------------------------
 
-/** ➡️ Эндпоинт для приема Job ID от коллектора. 🔥 ПРОПУСКАЕТ ДУБЛИКАТЫ. */
+/** ➡️ Эндпоинт для приема Job ID от коллектора. 🔥 ОБНОВЛЯЕТ ДУБЛИКАТЫ (Сброс TTL). */
 app.post('/api/submit_job_ids', async (req, res) => {
     const newJobIds = req.body.job_ids;
     if (!Array.isArray(newJobIds) || newJobIds.length === 0) {
@@ -81,23 +81,25 @@ app.post('/api/submit_job_ids', async (req, res) => {
         .join(',');
 
     if (!values) {
-        return res.json({ ok: true, added: 0, total: 0 });
+        return res.json({ ok: true, affected: 0, total: 0 });
     }
 
     try {
         const query = `
             INSERT INTO ${TABLE_NAME} (job_id, timestamp) 
             VALUES ${values}
-            ON CONFLICT (job_id) DO NOTHING; -- 🔥 ЭТО ГАРАНТИРУЕТ ПРОПУСК ДУБЛИКАТОВ
+            -- 🔥 ПРИ КОНФЛИКТЕ ОБНОВИТЬ ВРЕМЯ (TTL сброшен и Job ID становится "свежим")
+            ON CONFLICT (job_id) DO UPDATE SET timestamp = EXCLUDED.timestamp;
         `;
+        
         const result = await pool.query(query);
-        const addedCount = result.rowCount; // Количество успешно добавленных (не дубликатов)
+        const affectedCount = result.rowCount; 
 
         const totalResult = await pool.query(`SELECT COUNT(*) FROM ${TABLE_NAME}`);
         const totalCount = parseInt(totalResult.rows[0].count, 10);
         
-        console.log(`[SUBMIT] Added ${addedCount} new IDs. Total: ${totalCount}`);
-        res.json({ ok: true, added: addedCount, total: totalCount });
+        console.log(`[SUBMIT] Affected ${affectedCount} IDs (Inserted/Updated). Total: ${totalCount}`);
+        res.json({ ok: true, affected: affectedCount, total: totalCount });
 
     } catch (error) {
         console.error("[DB SUBMIT ERROR]:", error);
@@ -138,9 +140,9 @@ app.get('/api/get_job_id', async (req, res) => {
         // 3. ID найден. Удаляем его (внутри транзакции).
         await client.query(`DELETE FROM ${TABLE_NAME} WHERE job_id = $1`, [jobId]);
         
-        await client.query('COMMIT'); // 🚀 ФИНАЛИЗАЦИЯ ТРАНЗАКЦИИ
+        await client.query('COMMIT'); // 🚀 ФИНАЛИЗАЦИЯ ТРАНЗАКЦИИ: Select и Delete выполнены атомарно!
         
-        // 4. Считаем оставшиеся (Вне транзакции, т.к. это долгий запрос)
+        // 4. Считаем оставшиеся (Вне транзакции, чтобы не держать клиента пула долго)
         const totalResult = await pool.query(`SELECT COUNT(*) FROM ${TABLE_NAME}`);
         const remaining = parseInt(totalResult.rows[0].count, 10);
         
