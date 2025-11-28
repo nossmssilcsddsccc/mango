@@ -1,157 +1,137 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const { Pool } = require('pg'); 
-const app = express();
+// server.js (API Server Logic)
+
+import express from 'express';
+import Redis from 'ioredis';
+import bodyParser from 'body-parser';
+
+// --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
+// Используем URL из переменной окружения Render или локальный
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379'; 
 
-// ==========================================================
-// КОНФИГУРАЦИЯ
-// ==========================================================
-// Строка подключения к базе данных PostgreSQL (берется из переменных окружения хостинга)
-const DATABASE_URL = process.env.DATABASE_URL; 
+// Названия списков в Redis
+const AVAILABLE_JOBS_KEY = 'jobs:available';
+const ACTIVE_JOBS_KEY = 'jobs:active';
+const SUBMITTED_JOBS_KEY = 'jobs:submitted'; // Для хранения всех принятых ID
 
-// 🔥 Job ID считается действительным только в течение 1 часа.
-const JOB_ID_TTL_HOURS = 1; 
-const TABLE_NAME = 'job_ids';
-
-// 🔥 Инициализация пула PostgreSQL
-if (!DATABASE_URL) {
-    console.error("FATAL: DATABASE_URL is not set. Cannot connect to PostgreSQL.");
-    process.exit(1);
-}
-const pool = new Pool({
-    connectionString: DATABASE_URL,
-    // Настройки SSL/ConnectionString
-});
+// --- INIT ---
+const app = express();
+const redis = new Redis(REDIS_URL);
 
 app.use(bodyParser.json());
 
-// ------------------------------------------------------------
-// Инициализация базы данных и таблиц
-// ------------------------------------------------------------
-async function initDb() {
+// Проверка соединения с Redis
+redis.on('connect', () => {
+    console.log(`[REDIS] Connected to Redis at ${REDIS_URL}`);
+});
+redis.on('error', (err) => {
+    console.error('[REDIS ERROR]', err);
+    // В случае критической ошибки Redis, можно завершить работу
+    // process.exit(1);
+});
+
+// ------------------------------------------------------------------
+// 1. АТОМАРНАЯ ЛОГИКА ВЫДАЧИ JOB ID
+// ------------------------------------------------------------------
+
+/**
+ * Атомарно выдает один Job ID, перемещая его из доступных в активные.
+ * @returns {string | null} Выданный Job ID или null, если доступных нет.
+ */
+async function issueJobId() {
     try {
-        // 1. Убеждаемся, что таблица существует
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
-                job_id VARCHAR(50) PRIMARY KEY,
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                checked_at TIMESTAMP WITH TIME ZONE -- Оставляем, но не используем
-            );
-        `);
+        // RPOPLPUSH гарантирует, что Job ID будет взят только один раз
+        const jobId = await redis.rpoplpush(AVAILABLE_JOBS_KEY, ACTIVE_JOBS_KEY);
         
-        // 2. Патч для добавления колонки 'timestamp', если она отсутствовала (решает ошибку 42703)
-        try {
-             await pool.query(`
-                ALTER TABLE ${TABLE_NAME} ADD COLUMN timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
-             `);
-             console.log(`[DB PATCH] Successfully added column 'timestamp' to existing table.`);
-        } catch (e) {
-            if (e.code !== '42701') {
-                 console.warn(`[DB PATCH] Column 'timestamp' already existed or failed with non-fatal code: ${e.code}`);
-            }
+        if (jobId) {
+            const remaining = await redis.llen(AVAILABLE_JOBS_KEY);
+            console.log(`[GET] Issued TTL-valid jobId: ${jobId}. Remaining: ${remaining}`);
+            return jobId;
+        } else {
+            return null;
         }
-        
-        // 3. Создаем индекс
-        await pool.query(`
-            CREATE INDEX IF NOT EXISTS idx_timestamp ON ${TABLE_NAME} (timestamp);
-        `);
-        
-        console.log(`[INIT] PostgreSQL table '${TABLE_NAME}' ensured and ready.`);
     } catch (error) {
-        console.error("[ERROR] Failed to initialize database:", error);
-        process.exit(1);
+        console.error('[CRITICAL] Failed to issue job ID:', error);
+        return null;
     }
 }
 
-// ------------------------------------------------------------
-// API Эндпоинты
-// ------------------------------------------------------------
+// ------------------------------------------------------------------
+// 2. ЛОГИКА ПРИЕМА JOB ID ОТ СКАНЕРА (обновлено)
+// ------------------------------------------------------------------
 
-/** Эндпоинт для приема Job ID от коллектора. */
-app.post('/api/submit_job_ids', async (req, res) => {
-    const newJobIds = req.body.job_ids;
-    if (!Array.isArray(newJobIds) || newJobIds.length === 0) {
-        return res.status(400).json({ error: "job_ids array is required" });
-    }
-
-    const values = newJobIds
-        .filter(id => typeof id === 'string' && id.length > 5)
-        .map(id => `('${id}', NOW())`)
-        .join(',');
-
-    if (!values) {
-        return res.json({ ok: true, added: 0, total: 0 });
-    }
-
-    try {
-        const query = `
-            INSERT INTO ${TABLE_NAME} (job_id, timestamp) 
-            VALUES ${values}
-            ON CONFLICT (job_id) DO NOTHING;
-        `;
-        const result = await pool.query(query);
-        const addedCount = result.rowCount;
-
-        const totalResult = await pool.query(`SELECT COUNT(*) FROM ${TABLE_NAME}`);
-        const totalCount = parseInt(totalResult.rows[0].count, 10);
-        
-        console.log(`[SUBMIT] Added ${addedCount} new IDs. Total: ${totalCount}`);
-        res.json({ ok: true, added: addedCount, total: totalCount });
-
-    } catch (error) {
-        console.error("[DB SUBMIT ERROR]:", error);
-        res.status(500).json({ error: "Database error during submission." });
-    }
-});
-
-/** 🔥 Эндпоинт для выдачи самого старого ID с TTL=1 час. */
-app.get('/api/get_job_id', async (req, res) => {
-    try {
-        const expiryDate = new Date(Date.now() - JOB_ID_TTL_HOURS * 3600 * 1000).toISOString();
-
-        // 1. Ищем самый старый ID, который не истек по TTL (1 час)
-        // FOR UPDATE SKIP LOCKED предотвращает гонки при одновременных запросах
-        const queryResult = await pool.query(`
-            SELECT job_id
-            FROM ${TABLE_NAME}
-            WHERE timestamp > $1
-            ORDER BY timestamp ASC
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED; 
-        `, [expiryDate]);
-
-        const item = queryResult.rows[0];
-
-        if (!item) {
-            // Нет свежих ID. Удаляем устаревшие и сообщаем об ошибке.
-            await pool.query(`DELETE FROM ${TABLE_NAME} WHERE timestamp <= $1`, [expiryDate]);
-            return res.status(404).json({ error: "Queue is empty or all IDs have expired (TTL 1h)." });
-        }
-
-        const jobId = item.job_id;
-
-        // 2. ID найден. Удаляем его и возвращаем.
-        await pool.query(`DELETE FROM ${TABLE_NAME} WHERE job_id = $1`, [jobId]);
-        
-        const totalResult = await pool.query(`SELECT COUNT(*) FROM ${TABLE_NAME}`);
-        const remaining = parseInt(totalResult.rows[0].count, 10);
-        
-        console.log(`[GET] Issued TTL-valid JobID: ${jobId}. Remaining: ${remaining}`);
-        return res.json({ ok: true, job_id: jobId });
-        
-    } catch (error) {
-        console.error("[DB GET ERROR]:", error);
-        res.status(500).json({ error: "Database error during retrieval." });
-    }
-});
-
-// ------------------------------------------------------------
-// Запуск
-// ------------------------------------------------------------
-(async () => {
-    await initDb();
-    app.listen(PORT, () => {
-        console.log(`Server is running on port ${PORT}`);
+/**
+ * Обрабатывает список Job ID, полученных от сканера.
+ */
+async function submitJobIds(jobIds) {
+    if (!jobIds || jobIds.length === 0) return { affected: 0 };
+    
+    let addedCount = 0;
+    
+    // Используем транзакцию MULTI/EXEC для атомарного добавления
+    const multi = redis.multi();
+    
+    // 🔥 Pipelining (пакетирование) для высокой скорости записи
+    jobIds.forEach(id => {
+        // SADD (Set Add) гарантирует, что ID будет добавлен только один раз (уникальность)
+        multi.sadd(SUBMITTED_JOBS_KEY, id); 
     });
-})();
+    
+    try {
+        const results = await multi.exec();
+        
+        // Подсчитываем, сколько новых ID было добавлено (SADD возвращает 1, если новый)
+        results.forEach(result => {
+            if (result[1] === 1) { // result[1] - это результат команды SADD
+                addedCount++;
+            }
+        });
+        
+        return { affected: jobIds.length, added: addedCount };
+    } catch (error) {
+        console.error('[SUBMIT ERROR] Failed to execute transaction:', error);
+        return { affected: 0 };
+    }
+}
+
+
+// ------------------------------------------------------------------
+// 3. МАРШРУТЫ API
+// ------------------------------------------------------------------
+
+// Маршрут для выдачи Job ID
+app.get('/api/get_job_id', async (req, res) => {
+    const jobId = await issueJobId();
+    if (jobId) {
+        res.json({ jobId: jobId });
+    } else {
+        res.status(404).json({ error: 'No available Job IDs' });
+    }
+});
+
+// Маршрут для приема Job ID
+app.post('/api/submit_job_ids', async (req, res) => {
+    const jobIds = req.body.job_ids;
+    if (!jobIds || !Array.isArray(jobIds)) {
+        return res.status(400).json({ error: 'Invalid or missing job_ids array' });
+    }
+    
+    const result = await submitJobIds(jobIds);
+    res.json(result);
+});
+
+// ------------------------------------------------------------------
+// 4. ИНИЦИАЛИЗАЦИЯ (ОПЦИОНАЛЬНО)
+// ------------------------------------------------------------------
+
+// Запуск сервера
+app.listen(PORT, () => {
+    console.log(`\n--- Server running on port ${PORT} ---`);
+    console.log(`API URL: http://localhost:${PORT}/api/get_job_id`);
+});
+
+// --- ВНИМАНИЕ ---
+// Вам нужно создать начальный пул Job ID в Redis вручную или через отдельный скрипт.
+// Пример: redis.lpush(AVAILABLE_JOBS_KEY, 'jobId1', 'jobId2', 'jobId3', ...);
+// ИЛИ
+// redis.sadd(AVAILABLE_JOBS_KEY, 'jobId1', 'jobId2', ...);
