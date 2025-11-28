@@ -1,95 +1,121 @@
-// server.js (API Server Logic)
+// server.js (PostgreSQL API Server Logic)
 
 import express from 'express';
-import Redis from 'ioredis';
+import { Pool } from 'pg';
 import bodyParser from 'body-parser';
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-// Используем URL из переменной окружения Render или локальный
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379'; 
 
-// Названия списков в Redis
-const AVAILABLE_JOBS_KEY = 'jobs:available';
-const ACTIVE_JOBS_KEY = 'jobs:active';
-const SUBMITTED_JOBS_KEY = 'jobs:submitted'; // Для хранения всех принятых ID
+// 🔥 Конфигурация PostgreSQL
+const PG_CONFIG = {
+    user: process.env.PG_USER || 'your_user',
+    host: process.env.PG_HOST || 'localhost',
+    database: process.env.PG_DATABASE || 'your_db',
+    password: process.env.PG_PASSWORD || 'your_password',
+    port: process.env.PG_PORT || 5432,
+    max: 20, // Максимальное количество соединений в пуле
+    idleTimeoutMillis: 30000,
+};
 
 // --- INIT ---
 const app = express();
-const redis = new Redis(REDIS_URL);
+// Создание пула соединений
+const pool = new Pool(PG_CONFIG);
 
 app.use(bodyParser.json());
 
-// Проверка соединения с Redis
-redis.on('connect', () => {
-    console.log(`[REDIS] Connected to Redis at ${REDIS_URL}`);
+// Проверка соединения с БД
+pool.on('connect', () => {
+    console.log('[PG] Connected to PostgreSQL.');
 });
-redis.on('error', (err) => {
-    console.error('[REDIS ERROR]', err);
-    // В случае критической ошибки Redis, можно завершить работу
-    // process.exit(1);
+pool.on('error', (err) => {
+    console.error('[PG ERROR] Unexpected error on idle client', err);
+    process.exit(1);
 });
 
 // ------------------------------------------------------------------
-// 1. АТОМАРНАЯ ЛОГИКА ВЫДАЧИ JOB ID
+// 1. АТОМАРНАЯ ЛОГИКА ВЫДАЧИ JOB ID (Транзакция)
 // ------------------------------------------------------------------
 
 /**
- * Атомарно выдает один Job ID, перемещая его из доступных в активные.
- * @returns {string | null} Выданный Job ID или null, если доступных нет.
+ * Атомарно выдает один Job ID, используя транзакцию SELECT FOR UPDATE SKIP LOCKED.
+ * Это гарантирует, что два одновременных запроса не получат один и тот же ID.
+ * * @returns {string | null} Выданный Job ID или null.
  */
-async function issueJobId() {
+async function issueJobIdAtomic() {
+    let client;
+    let jobId = null;
+    
     try {
-        // RPOPLPUSH гарантирует, что Job ID будет взят только один раз
-        const jobId = await redis.rpoplpush(AVAILABLE_JOBS_KEY, ACTIVE_JOBS_KEY);
-        
-        if (jobId) {
-            const remaining = await redis.llen(AVAILABLE_JOBS_KEY);
-            console.log(`[GET] Issued TTL-valid jobId: ${jobId}. Remaining: ${remaining}`);
-            return jobId;
-        } else {
+        client = await pool.connect();
+        await client.query('BEGIN'); // 🔥 Шаг 1: Начинаем транзакцию
+
+        // 🔥 Шаг 2: Найти свободный ID и ЗАБЛОКИРОВАТЬ его строку (SELECT FOR UPDATE)
+        // SKIP LOCKED: Позволяет другим запросам не ждать, если строка уже заблокирована,
+        // а сразу переходить к следующей свободной.
+        const selectResult = await client.query(
+            `SELECT job_id 
+             FROM jobs 
+             WHERE status = 'available' 
+             LIMIT 1 
+             FOR UPDATE SKIP LOCKED;`
+        );
+
+        if (selectResult.rows.length === 0) {
+            await client.query('ROLLBACK'); // Ничего не нашли, откатываем
             return null;
         }
+
+        jobId = selectResult.rows[0].job_id;
+
+        // 🔥 Шаг 3: Пометить ID как "issued" (выданный)
+        await client.query(
+            `UPDATE jobs 
+             SET status = 'issued', issued_at = NOW() 
+             WHERE job_id = $1;`,
+            [jobId]
+        );
+
+        await client.query('COMMIT'); // 🔥 Шаг 4: Фиксируем транзакцию (изменения становятся постоянными)
+        
+        console.log(`[GET] Successfully issued atomic jobId: ${jobId}`);
+        return jobId;
+
     } catch (error) {
-        console.error('[CRITICAL] Failed to issue job ID:', error);
+        console.error(`[CRITICAL PG ERROR] Failed to issue job ID. Rolling back.`, error.message);
+        if (client) await client.query('ROLLBACK'); // Откат в случае любой ошибки
         return null;
+    } finally {
+        if (client) client.release(); // Возвращаем соединение в пул
     }
 }
 
 // ------------------------------------------------------------------
-// 2. ЛОГИКА ПРИЕМА JOB ID ОТ СКАНЕРА (обновлено)
+// 2. ЛОГИКА ПРИЕМА JOB ID ОТ СКАНЕРА (SADD для PostgreSQL)
 // ------------------------------------------------------------------
 
 /**
- * Обрабатывает список Job ID, полученных от сканера.
+ * Просто обновляет статус Job ID на "completed" (завершен).
+ * Предполагается, что IDs уже были приняты сканером.
  */
 async function submitJobIds(jobIds) {
     if (!jobIds || jobIds.length === 0) return { affected: 0 };
     
-    let addedCount = 0;
-    
-    // Используем транзакцию MULTI/EXEC для атомарного добавления
-    const multi = redis.multi();
-    
-    // 🔥 Pipelining (пакетирование) для высокой скорости записи
-    jobIds.forEach(id => {
-        // SADD (Set Add) гарантирует, что ID будет добавлен только один раз (уникальность)
-        multi.sadd(SUBMITTED_JOBS_KEY, id); 
-    });
-    
     try {
-        const results = await multi.exec();
+        // UNNEST - функция, которая "разворачивает" массив jobIds в список строк
+        const updateResult = await pool.query(
+            `UPDATE jobs 
+             SET status = 'completed' 
+             WHERE job_id = ANY($1::varchar[]) 
+             AND status = 'issued';`,
+            [jobIds]
+        );
         
-        // Подсчитываем, сколько новых ID было добавлено (SADD возвращает 1, если новый)
-        results.forEach(result => {
-            if (result[1] === 1) { // result[1] - это результат команды SADD
-                addedCount++;
-            }
-        });
-        
-        return { affected: jobIds.length, added: addedCount };
+        const affectedCount = updateResult.rowCount;
+        return { affected: affectedCount };
     } catch (error) {
-        console.error('[SUBMIT ERROR] Failed to execute transaction:', error);
+        console.error('[SUBMIT ERROR] Failed to update job statuses:', error);
         return { affected: 0 };
     }
 }
@@ -101,7 +127,7 @@ async function submitJobIds(jobIds) {
 
 // Маршрут для выдачи Job ID
 app.get('/api/get_job_id', async (req, res) => {
-    const jobId = await issueJobId();
+    const jobId = await issueJobIdAtomic();
     if (jobId) {
         res.json({ jobId: jobId });
     } else {
@@ -121,17 +147,10 @@ app.post('/api/submit_job_ids', async (req, res) => {
 });
 
 // ------------------------------------------------------------------
-// 4. ИНИЦИАЛИЗАЦИЯ (ОПЦИОНАЛЬНО)
+// 4. ЗАПУСК СЕРВЕРА
 // ------------------------------------------------------------------
 
-// Запуск сервера
 app.listen(PORT, () => {
     console.log(`\n--- Server running on port ${PORT} ---`);
-    console.log(`API URL: http://localhost:${PORT}/api/get_job_id`);
+    console.log(`Using PostgreSQL at ${PG_CONFIG.host}:${PG_CONFIG.port}`);
 });
-
-// --- ВНИМАНИЕ ---
-// Вам нужно создать начальный пул Job ID в Redis вручную или через отдельный скрипт.
-// Пример: redis.lpush(AVAILABLE_JOBS_KEY, 'jobId1', 'jobId2', 'jobId3', ...);
-// ИЛИ
-// redis.sadd(AVAILABLE_JOBS_KEY, 'jobId1', 'jobId2', ...);
