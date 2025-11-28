@@ -1,7 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const { Pool } = require('pg'); // 🔥 НУЖЕН POOL ДЛЯ PostgreSQL
+const { Pool } = require('pg'); 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -9,13 +9,11 @@ const PORT = process.env.PORT || 3000;
 // КОНФИГУРАЦИЯ
 // ==========================================================
 // URL для подключения к базе данных PostgreSQL.
-// Render и Railway обычно предоставляют эту переменную автоматически.
 const DATABASE_URL = process.env.DATABASE_URL; 
 
 const ROBLOX_PLACE_ID = "109983668079237";
 const ROBLOX_API_URL = 'https://games.roblox.com/v1/games/multiget-place-instances';
 const JOB_ID_TTL_HOURS = 1; // Время жизни Job ID в очереди (1 час)
-const MAX_QUEUE_SIZE = 50000; 
 const TABLE_NAME = 'job_ids';
 
 // 🔥 Инициализация пула PostgreSQL
@@ -25,25 +23,45 @@ if (!DATABASE_URL) {
 }
 const pool = new Pool({
     connectionString: DATABASE_URL,
-    // Добавьте ssl: { rejectUnauthorized: false } если вы используете локальный запуск 
-    // или хостинг, требующий SSL, но не имеющий сертификата
+    // На Render/Railway обычно не требуется SSL-конфиг,
+    // но если возникнут проблемы, добавьте: ssl: { rejectUnauthorized: false }
 });
 
 app.use(bodyParser.json());
 
 // ------------------------------------------------------------
-// Инициализация базы данных и таблиц
+// Инициализация базы данных (С ИСПРАВЛЕНИЕМ ОШИБКИ 42703)
 // ------------------------------------------------------------
 async function initDb() {
     try {
+        // 1. Убеждаемся, что таблица существует (CREATE TABLE IF NOT EXISTS)
         await pool.query(`
             CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
                 job_id VARCHAR(50) PRIMARY KEY,
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 checked_at TIMESTAMP WITH TIME ZONE
             );
+        `);
+        
+        // 2. 🔥 БЕЗОПАСНОЕ ИСПРАВЛЕНИЕ: Добавляем колонку 'timestamp', если она отсутствует.
+        // Это устраняет ошибку 'column "timestamp" does not exist' для старых таблиц.
+        try {
+             await pool.query(`
+                ALTER TABLE ${TABLE_NAME} ADD COLUMN timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+             `);
+             console.log(`[DB PATCH] Successfully added column 'timestamp' to existing table.`);
+        } catch (e) {
+            // Игнорируем ошибку, если колонка уже существует (code 42701)
+            if (e.code !== '42701') {
+                 console.warn(`[DB PATCH] Column 'timestamp' already existed or failed with non-fatal code: ${e.code}`);
+            }
+        }
+        
+        // 3. Создаем индекс
+        await pool.query(`
             CREATE INDEX IF NOT EXISTS idx_timestamp ON ${TABLE_NAME} (timestamp);
         `);
+        
         console.log(`[INIT] PostgreSQL table '${TABLE_NAME}' ensured and ready.`);
     } catch (error) {
         console.error("[ERROR] Failed to initialize database:", error);
@@ -53,7 +71,7 @@ async function initDb() {
 
 
 // ------------------------------------------------------------
-// 🔥 Проверка статуса Job ID в Roblox
+// 🔥 Проверка статуса Job ID в Roblox (Axios)
 // ------------------------------------------------------------
 async function checkRobloxServerStatus(jobId) {
     try {
@@ -73,6 +91,7 @@ async function checkRobloxServerStatus(jobId) {
             return false; // Сервер не найден, мертв, или полон
         }
     } catch (error) {
+        // В случае ошибки сети или таймаута, считаем сервер временно недоступным
         console.error(`[ROBLOX API ERROR] Failed to check JobID ${jobId}: ${error.message}`);
         return false; 
     }
@@ -89,7 +108,6 @@ app.post('/api/submit_job_ids', async (req, res) => {
         return res.status(400).json({ error: "job_ids array is required" });
     }
 
-    // Создаем строку для множественной вставки: ('job_id_1'), ('job_id_2')...
     const values = newJobIds
         .filter(id => typeof id === 'string' && id.length > 5)
         .map(id => `('${id}', NOW())`)
@@ -100,7 +118,7 @@ app.post('/api/submit_job_ids', async (req, res) => {
     }
 
     try {
-        // ON CONFLICT DO NOTHING предотвращает дублирование ID
+        // Используем ON CONFLICT DO NOTHING для предотвращения дублирования
         const query = `
             INSERT INTO ${TABLE_NAME} (job_id, timestamp) 
             VALUES ${values}
@@ -123,29 +141,24 @@ app.post('/api/submit_job_ids', async (req, res) => {
 
 /** 🔥 Эндпоинт для выдачи живого Job ID клиенту. */
 app.get('/api/get_job_id', async (req, res) => {
-    try {
-        // 1. Ищем самый старый ID, который еще не проверен, или самый старый живой, 
-        //    чей TTL еще не истек.
+    // Внутренняя функция для обработки рекурсивного поиска
+    const findLiveJobId = async () => {
+        // 1. Ищем самый старый ID, который не истек по TTL
         const expiryDate = new Date(Date.now() - JOB_ID_TTL_HOURS * 3600 * 1000).toISOString();
 
         const queryResult = await pool.query(`
             SELECT job_id
             FROM ${TABLE_NAME}
             WHERE timestamp > $1
-            ORDER BY checked_at ASC NULLS FIRST, timestamp ASC
+            ORDER BY timestamp ASC
             LIMIT 1
         `, [expiryDate]);
 
         const item = queryResult.rows[0];
 
         if (!item) {
-            const totalResult = await pool.query(`SELECT COUNT(*) FROM ${TABLE_NAME}`);
-            const totalCount = parseInt(totalResult.rows[0].count, 10);
-            
-            // Если в очереди нет "свежих" ID, очищаем старые и выходим.
-            if (totalCount > 0) {
-                 await pool.query(`DELETE FROM ${TABLE_NAME} WHERE timestamp < $1`, [expiryDate]);
-            }
+            // Нет свежих ID. Очищаем устаревшие, если таковые есть, и завершаем
+            await pool.query(`DELETE FROM ${TABLE_NAME} WHERE timestamp <= $1`, [expiryDate]);
             return res.status(404).json({ error: "No available fresh Job IDs found in queue." });
         }
 
@@ -168,11 +181,16 @@ app.get('/api/get_job_id', async (req, res) => {
             await pool.query(`DELETE FROM ${TABLE_NAME} WHERE job_id = $1`, [jobId]);
             console.log(`[GET] Deleted DEAD JobID: ${jobId}. Retrying...`);
             
-            // Рекурсивный вызов для поиска следующего живого ID
-            return await app.handle(req, res); // Использование Express router для рекурсии
+            // 🔥 РЕКУРСИЯ: Ищем следующий ID
+            return findLiveJobId();
         }
+    };
+    
+    try {
+        await findLiveJobId();
     } catch (error) {
         console.error("[DB GET ERROR]:", error);
+        // Защита от бесконечной рекурсии в случае ошибки базы данных
         res.status(500).json({ error: "Database error during retrieval." });
     }
 });
