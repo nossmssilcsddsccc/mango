@@ -34,13 +34,13 @@ async function initDb() {
         // 1. Убеждаемся, что таблица существует
         await pool.query(`
             CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
-                job_id VARCHAR(50) PRIMARY KEY,
+                job_id VARCHAR(50) PRIMARY KEY, -- PRIMARY KEY гарантирует, что job_id уникален
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                checked_at TIMESTAMP WITH TIME ZONE -- Оставляем, но не используем
+                checked_at TIMESTAMP WITH TIME ZONE
             );
         `);
         
-        // 2. Патч для добавления колонки 'timestamp', если она отсутствовала (решает ошибку 42703)
+        // 2. Патч для добавления колонки 'timestamp', если она отсутствовала
         try {
              await pool.query(`
                 ALTER TABLE ${TABLE_NAME} ADD COLUMN timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
@@ -68,7 +68,7 @@ async function initDb() {
 // API Эндпоинты
 // ------------------------------------------------------------
 
-/** Эндпоинт для приема Job ID от коллектора. */
+/** ➡️ Эндпоинт для приема Job ID от коллектора. 🔥 ПРОПУСКАЕТ ДУБЛИКАТЫ. */
 app.post('/api/submit_job_ids', async (req, res) => {
     const newJobIds = req.body.job_ids;
     if (!Array.isArray(newJobIds) || newJobIds.length === 0) {
@@ -88,10 +88,10 @@ app.post('/api/submit_job_ids', async (req, res) => {
         const query = `
             INSERT INTO ${TABLE_NAME} (job_id, timestamp) 
             VALUES ${values}
-            ON CONFLICT (job_id) DO NOTHING;
+            ON CONFLICT (job_id) DO NOTHING; -- 🔥 ЭТО ГАРАНТИРУЕТ ПРОПУСК ДУБЛИКАТОВ
         `;
         const result = await pool.query(query);
-        const addedCount = result.rowCount;
+        const addedCount = result.rowCount; // Количество успешно добавленных (не дубликатов)
 
         const totalResult = await pool.query(`SELECT COUNT(*) FROM ${TABLE_NAME}`);
         const totalCount = parseInt(totalResult.rows[0].count, 10);
@@ -105,35 +105,42 @@ app.post('/api/submit_job_ids', async (req, res) => {
     }
 });
 
-/** 🔥 Эндпоинт для выдачи самого старого ID с TTL=1 час. */
+/** ⬅️ Эндпоинт для выдачи самого старого ID с TTL=1 час. 🔥 ИСПОЛЬЗУЕТ ТРАНЗАКЦИИ. */
 app.get('/api/get_job_id', async (req, res) => {
+    // 1. Получаем клиента из пула для транзакции
+    const client = await pool.connect(); 
     try {
+        await client.query('BEGIN'); // 🚀 НАЧАЛО АТОМАРНОЙ ТРАНЗАКЦИИ
+
         const expiryDate = new Date(Date.now() - JOB_ID_TTL_HOURS * 3600 * 1000).toISOString();
 
-        // 1. Ищем самый старый ID, который не истек по TTL (1 час)
-        // FOR UPDATE SKIP LOCKED предотвращает гонки при одновременных запросах
-        const queryResult = await pool.query(`
+        // 2. Ищем и БЛОКИРУЕМ самый старый ID
+        const queryResult = await client.query(`
             SELECT job_id
             FROM ${TABLE_NAME}
             WHERE timestamp > $1
             ORDER BY timestamp ASC
             LIMIT 1
-            FOR UPDATE SKIP LOCKED; 
+            FOR UPDATE SKIP LOCKED; -- Блокировка и пропуск уже заблокированных
         `, [expiryDate]);
 
         const item = queryResult.rows[0];
 
         if (!item) {
             // Нет свежих ID. Удаляем устаревшие и сообщаем об ошибке.
-            await pool.query(`DELETE FROM ${TABLE_NAME} WHERE timestamp <= $1`, [expiryDate]);
+            await client.query(`DELETE FROM ${TABLE_NAME} WHERE timestamp <= $1`, [expiryDate]);
+            await client.query('COMMIT'); // Завершаем транзакцию
             return res.status(404).json({ error: "Queue is empty or all IDs have expired (TTL 1h)." });
         }
 
         const jobId = item.job_id;
 
-        // 2. ID найден. Удаляем его и возвращаем.
-        await pool.query(`DELETE FROM ${TABLE_NAME} WHERE job_id = $1`, [jobId]);
+        // 3. ID найден. Удаляем его (внутри транзакции).
+        await client.query(`DELETE FROM ${TABLE_NAME} WHERE job_id = $1`, [jobId]);
         
+        await client.query('COMMIT'); // 🚀 ФИНАЛИЗАЦИЯ ТРАНЗАКЦИИ
+        
+        // 4. Считаем оставшиеся (Вне транзакции, т.к. это долгий запрос)
         const totalResult = await pool.query(`SELECT COUNT(*) FROM ${TABLE_NAME}`);
         const remaining = parseInt(totalResult.rows[0].count, 10);
         
@@ -141,8 +148,11 @@ app.get('/api/get_job_id', async (req, res) => {
         return res.json({ ok: true, job_id: jobId });
         
     } catch (error) {
+        await client.query('ROLLBACK'); // Откатываем все изменения в случае ошибки
         console.error("[DB GET ERROR]:", error);
         res.status(500).json({ error: "Database error during retrieval." });
+    } finally {
+        client.release(); // Обязательно возвращаем клиента в пул
     }
 });
 
