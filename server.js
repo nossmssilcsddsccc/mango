@@ -6,28 +6,32 @@ import bodyParser from 'body-parser';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ВАЖНО: ВСТАВЬ СВОЮ СТРОКУ ПОДКЛЮЧЕНИЯ ИЗ NEON СЮДА!
-const NEON_CONNECTION_STRING = "postgres://username:password@ep-xxxxxx.eu-central-1.aws.neon.tech/neondb?sslmode=require";
+// Берём строку подключения ТОЛЬКО из секрета Render
+const NEON_CONNECTION_STRING = process.env.NEON_CONNECTION_STRING;
 
+if (!NEON_CONNECTION_STRING) {
+    console.error("ОШИБКА: Добавь переменную NEON_CONNECTION_STRING в Render → Environment!");
+    process.exit(1);
+}
+
+// Пул подключений к Neon
 const pool = new Pool({
     connectionString: NEON_CONNECTION_STRING,
-    ssl: {
-        rejectUnauthorized: false
-    },
+    ssl: { rejectUnauthorized: false },
     max: 20,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
+    connectionTimeoutMillis: 10000,
 });
 
-app.use(bodyParser.json({ limit: '10mb' })); // на всякий случай, если сканер шлёт много ID
+app.use(bodyParser.json({ limit: '10mb' }));
 
-pool.on('connect', () => console.log('[PG] Connected to Neon PostgreSQL'));
+pool.on('connect', () => console.log('[PG] Успешно подключено к Neon PostgreSQL'));
 pool.on('error', (err) => {
-    console.error('[PG CRITICAL ERROR]', err);
+    console.error('[PG КРИТИЧЕСКАЯ ОШИБКА]', err);
     process.exit(1);
 });
 
-// АТОМАРНАЯ ВЫДАЧА JOB ID
+// Атомарная выдача одного Job ID
 async function issueJobIdAtomic() {
     let client;
     try {
@@ -49,17 +53,15 @@ async function issueJobIdAtomic() {
         const jobId = res.rows[0].job_id;
 
         await client.query(`
-            UPDATE jobs
-            SET status = 'issued', issued_at = NOW()
+            UPDATE jobs SET status = 'issued', issued_at = NOW()
             WHERE job_id = $1
         `, [jobId]);
 
         await client.query('COMMIT');
-        console.log(`[GET] Issued Job ID: ${jobId}`);
+        console.log(`[ВЫДАНО] Job ID: ${jobId}`);
         return jobId;
-
     } catch (err) {
-        console.error('[ISSUE ERROR]', err.message);
+        console.error('[ОШИБКА ВЫДАЧИ]', err.message);
         if (client) await client.query('ROLLBACK');
         return null;
     } finally {
@@ -67,12 +69,12 @@ async function issueJobIdAtomic() {
     }
 }
 
-// ПРИЁМ НОВЫХ JOB ID ОТ СКАНЕРА
+// Приём новых Job ID от сканера
 app.post('/api/submit_job_ids', async (req, res) => {
     const jobIds = req.body.job_ids;
 
     if (!Array.isArray(jobIds) || jobIds.length === 0) {
-        return res.status(400).json({ error: 'job_ids must be non-empty array' });
+        return res.status(400).json({ error: 'job_ids должен быть массивом и не пустым' });
     }
 
     let client;
@@ -88,43 +90,51 @@ app.post('/api/submit_job_ids', async (req, res) => {
         `, [jobIds]);
 
         await client.query('COMMIT');
-
         const added = result.rowCount;
-        console.log(`[SUBMIT] +${added} new Job IDs (total received: ${jobIds.length})`);
+
+        console.log(`[ПРИНЯТО] +${added} новых Job ID (всего пришло: ${jobIds.length})`);
 
         res.json({
             added,
             total_received: jobIds.length,
-            message: `${added} new IDs saved (duplicates ignored)`
+            message: `${added} новых ID сохранено (дубли проигнорированы)`
         });
 
     } catch (err) {
-        console.error('[SUBMIT ERROR]', err.message);
+        console.error('[ОШИБКА ПРИЁМА]', err.message);
         if (client) await client.query('ROLLBACK');
-        res.status(500).json({ error: 'Database error' });
+        res.status(500).json({ error: 'Ошибка базы данных' });
     } finally {
         if (client) client.release();
     }
 });
 
-// ВЫДАЧА ОДНОГО JOB ID
+// Выдача одного Job ID
 app.get('/api/get_job_id', async (req, res) => {
     const jobId = await issueJobIdAtomic();
     if (jobId) {
         res.json({ jobId });
     } else {
-        res.status(404).json({ error: 'No available Job IDs' });
+        res.status(404).json({ error: 'Нет доступных Job ID' });
     }
 });
 
-// Статус сервера
+// Главная страница — просто проверка
 app.get('/', (req, res) => {
-    res.json({ status: 'Roblox Job ID API is running!', time: new Date().toISOString() });
+    res.json({ 
+        status: 'Roblox Job ID API работает!', 
+        time: new Date().toISOString(),
+        endpoints: {
+            "POST /api/submit_job_ids": "от сканера",
+            "GET /api/get_job_id": "для ботов (по одному ID)"
+        }
+    });
 });
 
 app.listen(PORT, () => {
-    console.log(`\nAPI SERVER RUNNING`);
-    console.log(`→ http://localhost:${PORT}`);
-    console.log(`→ POST /api/submit_job_ids ← от сканера`);
-    console.log(`→ GET /api/get_job_id    ← для ботов`);
+    console.log(`\nAPI ЗАПУЩЕН И ГОТОВ К БОЮ`);
+    console.log(`http://localhost:${PORT}`);
+    console.log(`POST → /api/submit_job_ids  ← сканер`);
+    console.log(`GET  → /api/get_job_id     ← 400+ ботов каждые 5 сек`);
+    console.log(`База: Neon (бесплатно навсегда)`);
 });
