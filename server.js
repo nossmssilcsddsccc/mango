@@ -1,156 +1,130 @@
-// server.js (PostgreSQL API Server Logic)
-
+// server.js
 import express from 'express';
 import { Pool } from 'pg';
 import bodyParser from 'body-parser';
 
-// --- CONFIGURATION ---
+const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 🔥 Конфигурация PostgreSQL
-const PG_CONFIG = {
-    user: process.env.PG_USER || 'your_user',
-    host: process.env.PG_HOST || 'localhost',
-    database: process.env.PG_DATABASE || 'your_db',
-    password: process.env.PG_PASSWORD || 'your_password',
-    port: process.env.PG_PORT || 5432,
-    max: 20, // Максимальное количество соединений в пуле
+// ВАЖНО: ВСТАВЬ СВОЮ СТРОКУ ПОДКЛЮЧЕНИЯ ИЗ NEON СЮДА!
+const NEON_CONNECTION_STRING = "postgres://username:password@ep-xxxxxx.eu-central-1.aws.neon.tech/neondb?sslmode=require";
+
+const pool = new Pool({
+    connectionString: NEON_CONNECTION_STRING,
+    ssl: {
+        rejectUnauthorized: false
+    },
+    max: 20,
     idleTimeoutMillis: 30000,
-};
-
-// --- INIT ---
-const app = express();
-// Создание пула соединений
-const pool = new Pool(PG_CONFIG);
-
-app.use(bodyParser.json());
-
-// Проверка соединения с БД
-pool.on('connect', () => {
-    console.log('[PG] Connected to PostgreSQL.');
+    connectionTimeoutMillis: 5000,
 });
+
+app.use(bodyParser.json({ limit: '10mb' })); // на всякий случай, если сканер шлёт много ID
+
+pool.on('connect', () => console.log('[PG] Connected to Neon PostgreSQL'));
 pool.on('error', (err) => {
-    console.error('[PG ERROR] Unexpected error on idle client', err);
+    console.error('[PG CRITICAL ERROR]', err);
     process.exit(1);
 });
 
-// ------------------------------------------------------------------
-// 1. АТОМАРНАЯ ЛОГИКА ВЫДАЧИ JOB ID (Транзакция)
-// ------------------------------------------------------------------
-
-/**
- * Атомарно выдает один Job ID, используя транзакцию SELECT FOR UPDATE SKIP LOCKED.
- * Это гарантирует, что два одновременных запроса не получат один и тот же ID.
- * * @returns {string | null} Выданный Job ID или null.
- */
+// АТОМАРНАЯ ВЫДАЧА JOB ID
 async function issueJobIdAtomic() {
     let client;
-    let jobId = null;
-    
     try {
         client = await pool.connect();
-        await client.query('BEGIN'); // 🔥 Шаг 1: Начинаем транзакцию
+        await client.query('BEGIN');
 
-        // 🔥 Шаг 2: Найти свободный ID и ЗАБЛОКИРОВАТЬ его строку (SELECT FOR UPDATE)
-        // SKIP LOCKED: Позволяет другим запросам не ждать, если строка уже заблокирована,
-        // а сразу переходить к следующей свободной.
-        const selectResult = await client.query(
-            `SELECT job_id 
-             FROM jobs 
-             WHERE status = 'available' 
-             LIMIT 1 
-             FOR UPDATE SKIP LOCKED;`
-        );
+        const res = await client.query(`
+            SELECT job_id FROM jobs
+            WHERE status = 'available'
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        `);
 
-        if (selectResult.rows.length === 0) {
-            await client.query('ROLLBACK'); // Ничего не нашли, откатываем
+        if (res.rows.length === 0) {
+            await client.query('ROLLBACK');
             return null;
         }
 
-        jobId = selectResult.rows[0].job_id;
+        const jobId = res.rows[0].job_id;
 
-        // 🔥 Шаг 3: Пометить ID как "issued" (выданный)
-        await client.query(
-            `UPDATE jobs 
-             SET status = 'issued', issued_at = NOW() 
-             WHERE job_id = $1;`,
-            [jobId]
-        );
+        await client.query(`
+            UPDATE jobs
+            SET status = 'issued', issued_at = NOW()
+            WHERE job_id = $1
+        `, [jobId]);
 
-        await client.query('COMMIT'); // 🔥 Шаг 4: Фиксируем транзакцию (изменения становятся постоянными)
-        
-        console.log(`[GET] Successfully issued atomic jobId: ${jobId}`);
+        await client.query('COMMIT');
+        console.log(`[GET] Issued Job ID: ${jobId}`);
         return jobId;
 
-    } catch (error) {
-        console.error(`[CRITICAL PG ERROR] Failed to issue job ID. Rolling back.`, error.message);
-        if (client) await client.query('ROLLBACK'); // Откат в случае любой ошибки
+    } catch (err) {
+        console.error('[ISSUE ERROR]', err.message);
+        if (client) await client.query('ROLLBACK');
         return null;
     } finally {
-        if (client) client.release(); // Возвращаем соединение в пул
+        if (client) client.release();
     }
 }
 
-// ------------------------------------------------------------------
-// 2. ЛОГИКА ПРИЕМА JOB ID ОТ СКАНЕРА (SADD для PostgreSQL)
-// ------------------------------------------------------------------
+// ПРИЁМ НОВЫХ JOB ID ОТ СКАНЕРА
+app.post('/api/submit_job_ids', async (req, res) => {
+    const jobIds = req.body.job_ids;
 
-/**
- * Просто обновляет статус Job ID на "completed" (завершен).
- * Предполагается, что IDs уже были приняты сканером.
- */
-async function submitJobIds(jobIds) {
-    if (!jobIds || jobIds.length === 0) return { affected: 0 };
-    
+    if (!Array.isArray(jobIds) || jobIds.length === 0) {
+        return res.status(400).json({ error: 'job_ids must be non-empty array' });
+    }
+
+    let client;
     try {
-        // UNNEST - функция, которая "разворачивает" массив jobIds в список строк
-        const updateResult = await pool.query(
-            `UPDATE jobs 
-             SET status = 'completed' 
-             WHERE job_id = ANY($1::varchar[]) 
-             AND status = 'issued';`,
-            [jobIds]
-        );
-        
-        const affectedCount = updateResult.rowCount;
-        return { affected: affectedCount };
-    } catch (error) {
-        console.error('[SUBMIT ERROR] Failed to update job statuses:', error);
-        return { affected: 0 };
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        const result = await client.query(`
+            INSERT INTO jobs (job_id, status)
+            VALUES (UNNEST($1::varchar[]), 'available')
+            ON CONFLICT (job_id) DO NOTHING
+            RETURNING job_id
+        `, [jobIds]);
+
+        await client.query('COMMIT');
+
+        const added = result.rowCount;
+        console.log(`[SUBMIT] +${added} new Job IDs (total received: ${jobIds.length})`);
+
+        res.json({
+            added,
+            total_received: jobIds.length,
+            message: `${added} new IDs saved (duplicates ignored)`
+        });
+
+    } catch (err) {
+        console.error('[SUBMIT ERROR]', err.message);
+        if (client) await client.query('ROLLBACK');
+        res.status(500).json({ error: 'Database error' });
+    } finally {
+        if (client) client.release();
     }
-}
+});
 
-
-// ------------------------------------------------------------------
-// 3. МАРШРУТЫ API
-// ------------------------------------------------------------------
-
-// Маршрут для выдачи Job ID
+// ВЫДАЧА ОДНОГО JOB ID
 app.get('/api/get_job_id', async (req, res) => {
     const jobId = await issueJobIdAtomic();
     if (jobId) {
-        res.json({ jobId: jobId });
+        res.json({ jobId });
     } else {
         res.status(404).json({ error: 'No available Job IDs' });
     }
 });
 
-// Маршрут для приема Job ID
-app.post('/api/submit_job_ids', async (req, res) => {
-    const jobIds = req.body.job_ids;
-    if (!jobIds || !Array.isArray(jobIds)) {
-        return res.status(400).json({ error: 'Invalid or missing job_ids array' });
-    }
-    
-    const result = await submitJobIds(jobIds);
-    res.json(result);
+// Статус сервера
+app.get('/', (req, res) => {
+    res.json({ status: 'Roblox Job ID API is running!', time: new Date().toISOString() });
 });
 
-// ------------------------------------------------------------------
-// 4. ЗАПУСК СЕРВЕРА
-// ------------------------------------------------------------------
-
 app.listen(PORT, () => {
-    console.log(`\n--- Server running on port ${PORT} ---`);
-    console.log(`Using PostgreSQL at ${PG_CONFIG.host}:${PG_CONFIG.port}`);
+    console.log(`\nAPI SERVER RUNNING`);
+    console.log(`→ http://localhost:${PORT}`);
+    console.log(`→ POST /api/submit_job_ids ← от сканера`);
+    console.log(`→ GET /api/get_job_id    ← для ботов`);
 });
