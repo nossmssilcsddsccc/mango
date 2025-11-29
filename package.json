@@ -1,7 +1,7 @@
 {
   "name": "roblox-job-api",
   "version": "1.0.0",
-  "description": "Free Neon + Render API for Roblox Job IDs",
+  "description": "Бесплатный API для хранения и выдачи Roblox Job ID (Neon + Render)",
   "main": "server.js",
   "type": "module",
   "scripts": {
